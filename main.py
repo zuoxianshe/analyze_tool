@@ -1098,21 +1098,31 @@ class AlarmMonitorWindow(tk.Toplevel):
         return " | ".join(vals)
 
     def _is_only_model(self, model_text, target):
-        target = str(target).strip()
-        if not target:
+        target_raw = str(target).strip()
+        if not target_raw:
             return True
-        text = str(model_text).replace(" ", "")
-        if target not in text:
+
+        # 统一归一化，避免“包含可命中、仅限不命中”的空格/大小写差异
+        def _norm(s):
+            return re.sub(r"\s+", "", str(s)).lower()
+
+        text = _norm(model_text)
+        target_norm = _norm(target_raw)
+        if not target_norm:
+            return True
+        if target_norm not in text:
             return False
-        separators = ["/", "、", ",", "，", ";", "；", "|"]
-        for sep in separators:
-            if sep in text:
-                parts = [p for p in text.split(sep) if p]
-                if not parts:
-                    return False
-                uniq = set(parts)
-                return len(uniq) == 1 and target in uniq
-        return True
+
+        # 支持常见分隔符；若出现多个机型，只允许全部都等于目标机型
+        if re.search(r"[/、,，;；|]+", text):
+            parts = [p for p in re.split(r"[/、,，;；|]+", text) if p]
+            if not parts:
+                return False
+            uniq = set(parts)
+            return len(uniq) == 1 and target_norm in uniq
+
+        # 无分隔符时保留“单机型字段可包含附加说明”的兼容行为
+        return target_norm in text
 
     def _collect_alarm_df(self, df, fru_kw="", model_kw="", model_only_kw=""):
         fru_col = self._pick_col(df, ["FRU对象", "FRU"])
@@ -1356,7 +1366,11 @@ class FileViewerApp(tkdnd.Tk):
         # 搜索相关变量（分开存储避免冲突）
         self.file_search_hits = []  # 文件名搜索结果 [(节点ID, 显示名称)]
         self.content_search_hits = []  # 内容搜索结果 [(行号, 列号, 内容)]
+        self.multi_content_search_hits = []  # 多文件内容搜索结果 [(节点ID, 行号, 列号, 行内容)]
+        self.preview_line_to_hit_index = []  # 兼容旧逻辑（保留）
+        self.preview_jump_entries = []  # 预览框行号到跳转目标映射（统一）
         self.current_search_type = ""  # "file" 或 "content"
+        self.search_text_cache = {}  # 多文件搜索文本缓存：node_id -> {"key": ..., "lines": [...]}
 
         # ========== 顶部综合工具区（文件操作 + 文字编辑） ==========
         self.frame_tools = tk.Frame(self, bg="#e8eef8", bd=2, relief=tk.RIDGE)
@@ -1428,6 +1442,9 @@ class FileViewerApp(tkdnd.Tk):
         self.search_btn = tk.Button(search_frame, text="🔍 搜索", width=8, command=self.smart_search, bg="#2196F3",
                                     fg="white")
         self.search_btn.pack(side="left", padx=4)
+        self.search_multi_btn = tk.Button(search_frame, text="📚 多文件", width=8, command=self.search_content_multi,
+                                          bg="#009688", fg="white")
+        self.search_multi_btn.pack(side="left", padx=4)
         self.clear_btn = tk.Button(search_frame, text="🧹 清空", width=8, command=self.clear_all_highlights,
                                    bg="#f4f4f4", fg="black")
         self.clear_btn.pack(side="left", padx=4)
@@ -1533,6 +1550,8 @@ class FileViewerApp(tkdnd.Tk):
         self.tree_frame.dnd_bind('<<Drop>>', self.on_drop)
         self.txt.drop_target_register(tkdnd.DND_FILES)
         self.txt.dnd_bind('<<Drop>>', self.on_drop)
+        self.bind_all("<Control-f>", self.focus_search_entry)
+        self.bind_all("<Control-F>", self.focus_search_entry)
 
     # ==============================
     # 基础工具函数
@@ -1596,6 +1615,15 @@ class FileViewerApp(tkdnd.Tk):
         self.current_search_type = mode
         mode_text = "文件名搜索" if mode == "file" else "内容搜索"
         self.search_status_label.config(text=f"当前模式：{mode_text}")
+
+    def focus_search_entry(self, event=None):
+        """Ctrl+F: 聚焦智能搜索框并选中现有内容"""
+        self.search_entry.focus_set()
+        text = self.search_entry.get()
+        if text:
+            self.search_entry.selection_range(0, tk.END)
+            self.search_entry.icursor(tk.END)
+        return "break"
 
     def refresh_line_numbers(self):
         """刷新行号"""
@@ -2589,6 +2617,8 @@ class FileViewerApp(tkdnd.Tk):
     def search_filename(self, keyword):
         """搜索文件名"""
         self.file_search_hits.clear()
+        self.preview_line_to_hit_index.clear()
+        self.preview_jump_entries.clear()
 
         # 递归遍历树节点
         def traverse(node):
@@ -2611,7 +2641,11 @@ class FileViewerApp(tkdnd.Tk):
 
         if self.file_search_hits:
             # 显示命中结果
-            hit_texts = [f"{idx + 1}. {name}" for idx, (nid, name) in enumerate(self.file_search_hits)]
+            hit_texts = []
+            for idx, (nid, name) in enumerate(self.file_search_hits, start=1):
+                hit_texts.append(f"{idx}. {name}")
+                self.preview_line_to_hit_index.append(idx - 1)
+                self.preview_jump_entries.append(("file", nid))
             self.result_txt.insert("1.0", "\n".join(hit_texts))
             self.result_title.config(text=f"🔍 文件名搜索结果 | 匹配数：{len(self.file_search_hits)}")
             # 定位到第一个结果
@@ -2632,6 +2666,8 @@ class FileViewerApp(tkdnd.Tk):
             return
 
         self.content_search_hits.clear()
+        self.preview_line_to_hit_index.clear()
+        self.preview_jump_entries.clear()
         self.txt.tag_remove("hl", "1.0", tk.END)
 
         # 重新插入文本（避免干扰）
@@ -2673,7 +2709,11 @@ class FileViewerApp(tkdnd.Tk):
 
         if self.content_search_hits:
             # 显示命中结果
-            hit_texts = [f"第{row}行: {content}" for row, col, content in self.content_search_hits]
+            hit_texts = []
+            for idx, (row, col, content) in enumerate(self.content_search_hits):
+                hit_texts.append(f"第{row}行: {content}")
+                self.preview_line_to_hit_index.append(idx)
+                self.preview_jump_entries.append(("content", int(row), int(col)))
             self.result_txt.insert("1.0", "\n".join(hit_texts))
             self.result_title.config(text=f"🔍 内容搜索结果 | 匹配数：{hit_count}")
         else:
@@ -2683,27 +2723,168 @@ class FileViewerApp(tkdnd.Tk):
         self.result_txt.config(state=tk.DISABLED)
         self.refresh_line_numbers()
 
+    def _extract_text_lines_for_search(self, node_id):
+        node_type = self.node_type.get(node_id)
+
+        # 缓存命中判断（避免重复解析大文件/PDF/DOC）
+        cache_key = None
+        if node_type == "file":
+            data = self.node_data.get(node_id, "")
+            if isinstance(data, str):
+                sample_head = data[:512]
+                sample_tail = data[-512:] if len(data) > 512 else data
+                cache_key = ("mem", len(data), sample_head, sample_tail)
+        elif node_type == "local_file":
+            file_path = normalize_input_path(self.node_data.get(node_id))
+            if file_path and os.path.exists(file_path):
+                try:
+                    st = os.stat(file_path)
+                    cache_key = ("path", file_path, int(st.st_mtime), st.st_size)
+                except Exception:
+                    cache_key = ("path", file_path, 0, 0)
+
+        if cache_key is not None:
+            cached = self.search_text_cache.get(node_id)
+            if cached and cached.get("key") == cache_key:
+                return cached.get("lines", [])
+
+        if node_type == "file":
+            data = self.node_data.get(node_id, "")
+            if isinstance(data, str):
+                lines = data.splitlines()
+                if cache_key is not None:
+                    self.search_text_cache[node_id] = {"key": cache_key, "lines": lines}
+                return lines
+            return []
+        if node_type == "local_file":
+            file_path = normalize_input_path(self.node_data.get(node_id))
+            if not file_path or not os.path.exists(file_path):
+                return []
+            file_ext = os.path.splitext(file_path)[1].lower()
+            try:
+                if file_ext == ".json":
+                    with open(file_path, "r", encoding="utf-8", errors="replace") as f:
+                        content = f.read()
+                    try:
+                        lines = json.dumps(json.loads(content), indent=4, ensure_ascii=False).splitlines()
+                        if cache_key is not None:
+                            self.search_text_cache[node_id] = {"key": cache_key, "lines": lines}
+                        return lines
+                    except Exception:
+                        lines = content.splitlines()
+                        if cache_key is not None:
+                            self.search_text_cache[node_id] = {"key": cache_key, "lines": lines}
+                        return lines
+                if file_ext in [".doc", ".docx"]:
+                    lines = extract_doc_text(file_path).splitlines()
+                    if cache_key is not None:
+                        self.search_text_cache[node_id] = {"key": cache_key, "lines": lines}
+                    return lines
+                if file_ext == ".pdf":
+                    lines = extract_pdf_text(file_path=file_path, max_pages=PDF_LARGE_MAX_PAGES).splitlines()
+                    if cache_key is not None:
+                        self.search_text_cache[node_id] = {"key": cache_key, "lines": lines}
+                    return lines
+                if file_ext in IMAGE_EXTENSIONS:
+                    return []
+                with open(file_path, "r", encoding="utf-8", errors="replace") as f:
+                    lines = f.read().splitlines()
+                if cache_key is not None:
+                    self.search_text_cache[node_id] = {"key": cache_key, "lines": lines}
+                return lines
+            except Exception:
+                return []
+        return []
+
+    def search_content_multi(self):
+        """多文件内容搜索"""
+        keyword = self.search_entry.get().strip()
+        if not keyword:
+            messagebox.showinfo("提示", "请输入搜索关键词")
+            return
+
+        self.clear_all_highlights()
+        self.multi_content_search_hits.clear()
+        self.preview_line_to_hit_index.clear()
+        self.preview_jump_entries.clear()
+        self.current_search_type = "content_multi"
+        kw_low = keyword.lower()
+        self.config(cursor="watch")
+        self.update_idletasks()
+
+        def traverse(node):
+            for child in self.tree.get_children(node):
+                node_type = self.node_type.get(child)
+                if node_type in ("file", "local_file"):
+                    lines = self._extract_text_lines_for_search(child)
+                    for row_idx, line in enumerate(lines, start=1):
+                        if not line:
+                            continue
+                        line_low = line.lower()
+                        col = line_low.find(kw_low)
+                        if col >= 0:
+                            self.multi_content_search_hits.append((child, row_idx, col, line.strip()))
+                traverse(child)
+
+        try:
+            traverse("")
+        finally:
+            self.config(cursor="")
+
+        self.result_txt.config(state=tk.NORMAL)
+        self.result_txt.delete("1.0", tk.END)
+        if self.multi_content_search_hits:
+            max_show = 500
+            show_hits = self.multi_content_search_hits[:max_show]
+            texts = []
+            for idx, (nid, row, col, line) in enumerate(show_hits, start=1):
+                name = self.tree.item(nid, "text")
+                texts.append(f"{idx}. [{name}] 第{row}行: {line}")
+                self.preview_line_to_hit_index.append(idx - 1)
+                self.preview_jump_entries.append(("content_multi", nid, int(row), int(col)))
+            if len(self.multi_content_search_hits) > max_show:
+                texts.append(f"... 共 {len(self.multi_content_search_hits)} 条，仅显示前 {max_show} 条")
+                self.preview_jump_entries.append(None)
+            self.result_txt.insert("1.0", "\n".join(texts))
+            self.result_title.config(text=f"🔍 多文件内容搜索 | 匹配数：{len(self.multi_content_search_hits)}")
+        else:
+            self.result_txt.insert("1.0", "未找到匹配的内容")
+            self.result_title.config(text="🔍 多文件内容搜索 | 匹配数：0")
+        self.result_txt.config(state=tk.DISABLED)
+
     def on_double_click_jump(self, event):
         """双击搜索结果跳转"""
         try:
-            # 获取点击的行号
-            click_index = self.result_txt.index(tk.CURRENT)
+            click_index = self.result_txt.index(f"@{event.x},{event.y}")
             line_num = int(click_index.split(".")[0]) - 1
+            if line_num < 0 or line_num >= len(self.preview_jump_entries):
+                return
+            entry = self.preview_jump_entries[line_num]
+            if not entry:
+                return
+            jump_type = entry[0]
 
-            if self.current_search_type == "file" and 0 <= line_num < len(self.file_search_hits):
-                # 文件名搜索跳转
-                node_id, _ = self.file_search_hits[line_num]
+            if jump_type == "file":
+                node_id = entry[1]
                 self.tree.selection_set(node_id)
                 self.tree.see(node_id)
                 self.tree.focus_set()
-            elif self.current_search_type == "content" and 0 <= line_num < len(self.content_search_hits):
-                # 内容搜索跳转
-                row, col, _ = self.content_search_hits[line_num]
+            elif jump_type == "content":
+                row, col = entry[1], entry[2]
                 target_pos = f"{row}.{col}"
-                # 标记跳转行
                 self.txt.tag_remove("jump_hl", "1.0", tk.END)
                 self.txt.tag_add("jump_hl", f"{row}.0", f"{row}.end")
-                # 定位并聚焦
+                self.txt.mark_set(tk.INSERT, target_pos)
+                self.txt.see(target_pos)
+                self.txt.focus_set()
+            elif jump_type == "content_multi":
+                node_id, row, col = entry[1], entry[2], entry[3]
+                self.tree.selection_set(node_id)
+                self.tree.see(node_id)
+                self.on_tree_select(None)
+                target_pos = f"{row}.{max(0, col)}"
+                self.txt.tag_remove("jump_hl", "1.0", tk.END)
+                self.txt.tag_add("jump_hl", f"{row}.0", f"{row}.end")
                 self.txt.mark_set(tk.INSERT, target_pos)
                 self.txt.see(target_pos)
                 self.txt.focus_set()
@@ -2736,6 +2917,10 @@ class FileViewerApp(tkdnd.Tk):
         # 清空搜索结果列表
         self.file_search_hits.clear()
         self.content_search_hits.clear()
+        self.multi_content_search_hits.clear()
+        self.preview_line_to_hit_index.clear()
+        self.preview_jump_entries.clear()
+        self.search_text_cache.clear()
 
 
 # ==============================
