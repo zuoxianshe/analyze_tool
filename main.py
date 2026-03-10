@@ -67,7 +67,39 @@ PREVIEW_READ_BYTES = 256 * 1024
 PDF_LARGE_MAX_PAGES = 10
 TABULAR_PREVIEW_ROWS = 3000
 ARCHIVE_MEMBER_PREVIEW_BYTES = 2 * 1024 * 1024
+ARCHIVE_MEMBER_FULL_READ_BYTES = 32 * 1024 * 1024
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp", ".gif", ".webp", ".tif", ".tiff"}
+
+
+def decode_bytes_auto(data):
+    """Best-effort bytes->text decode for mixed Chinese/Unicode files."""
+    if data is None:
+        return ""
+    if isinstance(data, str):
+        return data
+    if not isinstance(data, (bytes, bytearray)):
+        return str(data)
+
+    b = bytes(data)
+    # UTF BOM first
+    for enc in ("utf-8-sig", "utf-16", "utf-16-le", "utf-16-be", "utf-32"):
+        try:
+            return b.decode(enc)
+        except Exception:
+            pass
+    # Common Windows/Chinese encodings
+    for enc in ("utf-8", "gb18030", "gbk", "big5", "cp1252", "latin-1"):
+        try:
+            return b.decode(enc)
+        except Exception:
+            pass
+    return b.decode("utf-8", errors="replace")
+
+
+def read_text_file_auto(file_path):
+    """Read text file with encoding fallback."""
+    with open(file_path, "rb") as f:
+        return decode_bytes_auto(f.read())
 
 
 def read_text_preview_from_path(file_path, max_bytes=PREVIEW_READ_BYTES):
@@ -75,7 +107,7 @@ def read_text_preview_from_path(file_path, max_bytes=PREVIEW_READ_BYTES):
         with open(file_path, "rb") as f:
             data = f.read(max_bytes + 1)
         truncated = len(data) > max_bytes
-        text = data[:max_bytes].decode("utf-8", errors="replace")
+        text = decode_bytes_auto(data[:max_bytes])
         if truncated:
             text += f"\n\n[预览模式] 文件较大，仅显示前 {max_bytes // 1024}KB。"
         return text
@@ -86,7 +118,7 @@ def read_text_preview_from_path(file_path, max_bytes=PREVIEW_READ_BYTES):
 def read_text_preview_from_bytes(file_data, max_bytes=PREVIEW_READ_BYTES):
     data = file_data[: max_bytes + 1]
     truncated = len(data) > max_bytes
-    text = data[:max_bytes].decode("utf-8", errors="replace")
+    text = decode_bytes_auto(data[:max_bytes])
     if truncated:
         text += f"\n\n[预览模式] 文件较大，仅显示前 {max_bytes // 1024}KB。"
     return text
@@ -242,20 +274,46 @@ def extract_pdf_single_page_image_bytes(file_path=None, file_bytes=None, page_no
         return None
 
 
-def extract_docx_text(file_path):
+def extract_docx_text(file_path=None, file_bytes=None):
     try:
-        with zipfile.ZipFile(file_path) as zf:
-            xml_bytes = zf.read("word/document.xml")
-        root = ET.fromstring(xml_bytes)
+        zsrc = io.BytesIO(file_bytes) if file_bytes is not None else file_path
+        with zipfile.ZipFile(zsrc) as zf:
+            names = set(zf.namelist())
+            doc_parts = []
+            if "word/document.xml" in names:
+                doc_parts.append("word/document.xml")
+            doc_parts.extend(sorted([n for n in names if n.startswith("word/header") and n.endswith(".xml")]))
+            doc_parts.extend(sorted([n for n in names if n.startswith("word/footer") and n.endswith(".xml")]))
+            for p in ("word/footnotes.xml", "word/endnotes.xml", "word/comments.xml"):
+                if p in names:
+                    doc_parts.append(p)
+            if not doc_parts:
+                return "(DOCX中未找到可解析的XML文本内容)"
+
+            xml_docs = []
+            for part in doc_parts:
+                try:
+                    xml_docs.append(zf.read(part))
+                except Exception:
+                    continue
+
         ns = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"}
         lines = []
-        for para in root.findall(".//w:p", ns):
-            texts = []
-            for t in para.findall(".//w:t", ns):
-                texts.append(t.text or "")
-            line = "".join(texts).strip()
-            if line:
-                lines.append(line)
+        for xml_bytes in xml_docs:
+            root = ET.fromstring(xml_bytes)
+            for para in root.findall(".//w:p", ns):
+                parts = []
+                for node in para.iter():
+                    tag = node.tag.split("}")[-1] if "}" in node.tag else node.tag
+                    if tag == "t":
+                        parts.append(node.text or "")
+                    elif tag == "tab":
+                        parts.append("\t")
+                    elif tag in ("br", "cr"):
+                        parts.append("\n")
+                line = "".join(parts).strip()
+                if line:
+                    lines.append(line)
         text = "\n".join(lines).strip()
         return text if text else "(DOCX中未提取到文本)"
     except Exception as e:
@@ -626,20 +684,17 @@ class TextCompareWindow(tk.Toplevel):
             elif file_ext == '.csv':
                 if not PANDAS_AVAILABLE:
                     # 降级为普通文本读取
-                    with open(file_path, 'r', encoding='utf-8', errors='replace') as f:
-                        return f.read(), file_ext
+                    return read_text_file_auto(file_path), file_ext
                 try:
                     df = pd.read_csv(file_path, nrows=TABULAR_PREVIEW_ROWS)
                     return df.to_string(index=False), file_ext
                 except Exception as e:
                     # 降级读取
-                    with open(file_path, 'r', encoding='utf-8', errors='replace') as f:
-                        return f.read(), file_ext
+                    return read_text_file_auto(file_path), file_ext
 
             # JSON文件
             elif file_ext == '.json':
-                with open(file_path, 'r', encoding='utf-8', errors='replace') as f:
-                    content = f.read()
+                content = read_text_file_auto(file_path)
                 # 格式化JSON以便对比
                 return self.parse_json(content), file_ext
             elif file_ext in ['.doc', '.docx']:
@@ -649,8 +704,7 @@ class TextCompareWindow(tk.Toplevel):
 
             # 普通文本文件 (txt/xml/md/py等)
             else:
-                with open(file_path, 'r', encoding='utf-8', errors='replace') as f:
-                    return f.read(), file_ext
+                return read_text_file_auto(file_path), file_ext
 
         except Exception as e:
             messagebox.showerror("错误", f"读取文件失败：{str(e)}")
@@ -1573,7 +1627,9 @@ class FileViewerApp(tkdnd.Tk):
         self.result_title = tk.Label(self.result_frame, text="🔍 搜索结果预览 | 匹配数：0", bg="#f0f8f8",
                                      font=("微软雅黑", 9, "bold"), fg="#2196F3")
         self.result_title.pack(anchor="w", padx=5, pady=2)
-        self.result_txt = scrolledtext.ScrolledText(self.result_frame, font=("Consolas", 10), bg="#fffff8", height=1)
+        self.result_txt = scrolledtext.ScrolledText(
+            self.result_frame, font=("Consolas", 10), bg="#fffff8", height=1, wrap=tk.NONE
+        )
         self.result_txt.pack(fill="both", expand=True, padx=5, pady=2)
         self.result_txt.config(state=tk.DISABLED)
         # 双击跳转绑定
@@ -2224,12 +2280,10 @@ class FileViewerApp(tkdnd.Tk):
                                 content = df.to_string(index=False)
                         else:
                             # 降级为普通文本读取
-                            with open(file_path, 'r', encoding='utf-8', errors='replace') as f:
-                                content = f.read()
+                            content = read_text_file_auto(file_path)
                     # JSON文件格式化
                     elif file_ext == '.json':
-                        with open(file_path, 'r', encoding='utf-8', errors='replace') as f:
-                            json_content = f.read()
+                        json_content = read_text_file_auto(file_path)
                         try:
                             json_data = json.loads(json_content)
                             content = json.dumps(json_data, indent=4, ensure_ascii=False)
@@ -2239,8 +2293,7 @@ class FileViewerApp(tkdnd.Tk):
                         content = extract_doc_text(file_path)
                     else:
                         # 普通文本文件
-                        with open(file_path, 'r', encoding='utf-8', errors='replace') as f:
-                            content = f.read()
+                        content = read_text_file_auto(file_path)
 
                 self.clear_pdf_lazy_state()
                 self.current_text_content = content
@@ -2292,7 +2345,9 @@ class FileViewerApp(tkdnd.Tk):
                             dirs.add(info.filename)
                         elif info.file_size > 0:
                             with zf.open(info) as f:
-                                member_data = f.read(min(info.file_size, ARCHIVE_MEMBER_PREVIEW_BYTES) + 1)
+                                read_limit = info.file_size if info.file_size <= ARCHIVE_MEMBER_FULL_READ_BYTES else (
+                                            ARCHIVE_MEMBER_PREVIEW_BYTES + 1)
+                                member_data = f.read(read_limit)
                             files.append((info.filename, member_data, info.file_size))
                             # 添加文件所在目录
                             file_dir = os.path.dirname(info.filename)
@@ -2308,7 +2363,9 @@ class FileViewerApp(tkdnd.Tk):
                         elif member.isfile() and member.size > 0:
                             extracted = tf.extractfile(member)
                             if extracted:
-                                file_data = extracted.read(min(member.size, ARCHIVE_MEMBER_PREVIEW_BYTES) + 1)
+                                read_limit = member.size if member.size <= ARCHIVE_MEMBER_FULL_READ_BYTES else (
+                                            ARCHIVE_MEMBER_PREVIEW_BYTES + 1)
+                                file_data = extracted.read(read_limit)
                                 files.append((member.name, file_data, member.size))
                             file_dir = os.path.dirname(member.name)
                             if file_dir:
@@ -2317,14 +2374,20 @@ class FileViewerApp(tkdnd.Tk):
             elif arch_type == 'gz':
                 with gzip.GzipFile(fileobj=buf) as gf:
                     new_name = archive_name[:-3] if archive_name.lower().endswith('.gz') else archive_name + '.unzip'
-                    data = gf.read(ARCHIVE_MEMBER_PREVIEW_BYTES + 1)
-                    files.append((new_name, data, len(data)))
+                    data = gf.read(ARCHIVE_MEMBER_FULL_READ_BYTES + 1)
+                    original_size = len(data)
+                    if len(data) > ARCHIVE_MEMBER_FULL_READ_BYTES:
+                        data = data[:ARCHIVE_MEMBER_PREVIEW_BYTES + 1]
+                    files.append((new_name, data, original_size))
 
             elif arch_type == 'bz2':
                 with bz2.BZ2File(fileobj=buf) as bf:
                     new_name = archive_name[:-4] if archive_name.lower().endswith('.bz2') else archive_name + '.unzip'
-                    data = bf.read(ARCHIVE_MEMBER_PREVIEW_BYTES + 1)
-                    files.append((new_name, data, len(data)))
+                    data = bf.read(ARCHIVE_MEMBER_FULL_READ_BYTES + 1)
+                    original_size = len(data)
+                    if len(data) > ARCHIVE_MEMBER_FULL_READ_BYTES:
+                        data = data[:ARCHIVE_MEMBER_PREVIEW_BYTES + 1]
+                    files.append((new_name, data, original_size))
 
         except Exception as e:
             messagebox.showerror("解析错误", f"压缩包解析失败：{str(e)}")
@@ -2351,7 +2414,7 @@ class FileViewerApp(tkdnd.Tk):
 
             # 判断是否是嵌套压缩包
             if self.guess_archive_type(file_name, file_data):
-                if len(file_data) > ARCHIVE_MEMBER_PREVIEW_BYTES:
+                if original_size > len(file_data):
                     tip_content = (
                         f"=== 嵌套压缩包预览：{file_name} ===\n"
                         f"[性能模式] 仅加载了前{ARCHIVE_MEMBER_PREVIEW_BYTES // 1024 // 1024}MB，"
@@ -2373,9 +2436,9 @@ class FileViewerApp(tkdnd.Tk):
                 # 普通文件（支持多格式解析）
                 try:
                     file_ext = os.path.splitext(file_name)[1].lower()
-                    is_truncated_in_archive = len(file_data) > ARCHIVE_MEMBER_PREVIEW_BYTES
+                    is_truncated_in_archive = original_size > len(file_data)
                     effective_data = file_data[:ARCHIVE_MEMBER_PREVIEW_BYTES] if is_truncated_in_archive else file_data
-                    if original_size > LARGE_FILE_THRESHOLD or is_truncated_in_archive:
+                    if is_truncated_in_archive:
                         if file_ext == '.pdf':
                             file_content = {
                                 "kind": "pdf_bytes",
@@ -2404,33 +2467,19 @@ class FileViewerApp(tkdnd.Tk):
                                     content.append(df.to_string(index=False))
                                 file_content = "\n".join(content)
                             elif file_ext == '.csv':
-                                csv_buf = io.StringIO(effective_data.decode('utf-8', errors='replace'))
+                                csv_buf = io.StringIO(decode_bytes_auto(effective_data))
                                 df = pd.read_csv(csv_buf, nrows=TABULAR_PREVIEW_ROWS)
                                 file_content = df.to_string(index=False)
                         elif file_ext == '.json':
                             # JSON格式化
-                            json_content = effective_data.decode('utf-8', errors='replace')
+                            json_content = decode_bytes_auto(effective_data)
                             try:
                                 json_data = json.loads(json_content)
                                 file_content = json.dumps(json_data, indent=4, ensure_ascii=False)
                             except:
                                 file_content = json_content
                         elif file_ext == '.docx':
-                            try:
-                                tmp_docx = io.BytesIO(effective_data)
-                                with zipfile.ZipFile(tmp_docx) as zf:
-                                    xml_bytes = zf.read("word/document.xml")
-                                root = ET.fromstring(xml_bytes)
-                                ns = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"}
-                                lines = []
-                                for para in root.findall(".//w:p", ns):
-                                    texts = [t.text or "" for t in para.findall(".//w:t", ns)]
-                                    line = "".join(texts).strip()
-                                    if line:
-                                        lines.append(line)
-                                file_content = "\n".join(lines) if lines else "(DOCX中未提取到文本)"
-                            except Exception as e:
-                                file_content = f"(DOCX解析失败: {str(e)})"
+                            file_content = extract_docx_text(file_bytes=effective_data)
                         elif file_ext == '.doc':
                             file_content = "(压缩包内 .doc 暂不支持直接解析，请先解压到本地后打开)"
                         elif file_ext == '.pdf':
@@ -2450,7 +2499,7 @@ class FileViewerApp(tkdnd.Tk):
                             }
                         else:
                             # 普通文本解码
-                            file_content = effective_data.decode("utf-8", errors="replace")
+                            file_content = decode_bytes_auto(effective_data)
                 except:
                     file_content = "(二进制文件/解码失败)"
 
@@ -2803,8 +2852,7 @@ class FileViewerApp(tkdnd.Tk):
             file_ext = os.path.splitext(file_path)[1].lower()
             try:
                 if file_ext == ".json":
-                    with open(file_path, "r", encoding="utf-8", errors="replace") as f:
-                        content = f.read()
+                    content = read_text_file_auto(file_path)
                     try:
                         lines = json.dumps(json.loads(content), indent=4, ensure_ascii=False).splitlines()
                         if cache_key is not None:
@@ -2827,8 +2875,7 @@ class FileViewerApp(tkdnd.Tk):
                     return lines
                 if file_ext in IMAGE_EXTENSIONS:
                     return []
-                with open(file_path, "r", encoding="utf-8", errors="replace") as f:
-                    lines = f.read().splitlines()
+                lines = read_text_file_auto(file_path).splitlines()
                 if cache_key is not None:
                     self.search_text_cache[node_id] = {"key": cache_key, "lines": lines}
                 return lines
@@ -2897,7 +2944,12 @@ class FileViewerApp(tkdnd.Tk):
         try:
             click_index = self.result_txt.index(f"@{event.x},{event.y}")
             line_num = int(click_index.split(".")[0]) - 1
-            if line_num < 0 or line_num >= len(self.preview_jump_entries):
+            if line_num < 0:
+                return
+            # 点击空白区域或末尾时，回退到最后一条有效映射
+            if line_num >= len(self.preview_jump_entries):
+                line_num = len(self.preview_jump_entries) - 1
+            if line_num < 0:
                 return
             entry = self.preview_jump_entries[line_num]
             if not entry:
@@ -2913,7 +2965,11 @@ class FileViewerApp(tkdnd.Tk):
                 row, col = entry[1], entry[2]
                 target_pos = f"{row}.{col}"
                 self.txt.tag_remove("jump_hl", "1.0", tk.END)
+                self.txt.tag_remove("hl", "1.0", tk.END)
                 self.txt.tag_add("jump_hl", f"{row}.0", f"{row}.end")
+                if col >= 0:
+                    end_col = col + max(1, len(self.search_entry.get().strip()))
+                    self.txt.tag_add("hl", f"{row}.{col}", f"{row}.{end_col}")
                 self.txt.mark_set(tk.INSERT, target_pos)
                 self.txt.see(target_pos)
                 self.txt.focus_set()
@@ -2924,7 +2980,11 @@ class FileViewerApp(tkdnd.Tk):
                 self.on_tree_select(None)
                 target_pos = f"{row}.{max(0, col)}"
                 self.txt.tag_remove("jump_hl", "1.0", tk.END)
+                self.txt.tag_remove("hl", "1.0", tk.END)
                 self.txt.tag_add("jump_hl", f"{row}.0", f"{row}.end")
+                if col >= 0:
+                    end_col = col + max(1, len(self.search_entry.get().strip()))
+                    self.txt.tag_add("hl", f"{row}.{col}", f"{row}.{end_col}")
                 self.txt.mark_set(tk.INSERT, target_pos)
                 self.txt.see(target_pos)
                 self.txt.focus_set()
