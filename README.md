@@ -105,8 +105,5 @@ py -3 smart.py
 - PDF 乱码/慢
   - 已内置多解析器回退与分页懒加载；超大文件建议使用分页浏览与关键词搜索
 
-## 7. 项目文件
 
-- 主程序：`smart.py`
-- 规则文档：`BMC_BIOS_Redfish_Registry_规则整理.md`
 
