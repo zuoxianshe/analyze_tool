@@ -1465,6 +1465,7 @@ class FileViewerApp(tkdnd.Tk):
         self.preview_jump_entries = []  # 预览框行号到跳转目标映射（统一）
         self.current_search_type = ""  # "file" 或 "content"
         self.search_text_cache = {}  # 多文件搜索文本缓存：node_id -> {"key": ..., "lines": [...]}
+        self._pending_multi_jump = None
 
         # ========== 顶部综合工具区（文件操作 + 文字编辑） ==========
         self.frame_tools = tk.Frame(self, bg="#e8eef8", bd=2, relief=tk.RIDGE)
@@ -1569,6 +1570,10 @@ class FileViewerApp(tkdnd.Tk):
 
         # 右上：文本编辑区
         self.text_panel = tk.Frame(self.right_paned, bg="#f4f4f4")
+        self.current_file_label = tk.Label(
+            self.text_panel, text="当前文件：-", bg="#f4f4f4", fg="#37474f", anchor="w", font=("微软雅黑", 9, "bold")
+        )
+        self.current_file_label.pack(fill="x", padx=6, pady=(2, 0))
         self.txt_container = tk.Frame(self.text_panel, bg="#f4f4f4")
         self.txt_container.pack(fill="both", expand=True)
         self.pdf_nav_frame = tk.Frame(self.text_panel, bg="#f4f4f4", bd=0, highlightthickness=0, height=34)
@@ -1588,8 +1593,11 @@ class FileViewerApp(tkdnd.Tk):
         self.pdf_nav_frame.place_forget()
         self.line_num = tk.Text(self.txt_container, width=5, state="disabled", bg="#f0f0f0", font=self.line_num_font)
         self.line_num.pack(side="left", fill="y")
-        self.txt = scrolledtext.ScrolledText(self.txt_container, font=self.editor_font, wrap="word", bg="white")
+        self.txt = scrolledtext.ScrolledText(self.txt_container, font=self.editor_font, wrap=tk.NONE, bg="white")
         self.txt.pack(side="right", fill="both", expand=True)
+        self.txt_xbar = ttk.Scrollbar(self.text_panel, orient="horizontal", command=self.txt.xview)
+        self.txt_xbar.pack(fill="x", padx=2, pady=(0, 2))
+        self.txt.configure(xscrollcommand=self.txt_xbar.set)
         self.pdf_corner_label = tk.Label(
             self.txt_container, text="", bg="#eef3ff", fg="#1f3a93", font=("微软雅黑", 9, "bold"),
             bd=1, relief=tk.SOLID, padx=6, pady=2
@@ -1721,6 +1729,10 @@ class FileViewerApp(tkdnd.Tk):
             self.search_entry.icursor(tk.END)
         return "break"
 
+    def set_current_file_label(self, file_name):
+        name = str(file_name).strip() if file_name else "-"
+        self.current_file_label.config(text=f"当前文件：{name}")
+
     def refresh_line_numbers(self):
         """刷新行号"""
         self.line_num.config(state=tk.NORMAL)
@@ -1773,6 +1785,50 @@ class FileViewerApp(tkdnd.Tk):
             self.set_markdown_render_button_state(False)
         self.current_text_content = self.txt.get("1.0", "end-1c")
         self.refresh_line_numbers()
+
+    def _resolve_jump_target(self, expect_row, expect_col, keyword):
+        """Ensure jump lands on a real hit line; fallback to nearest matched line."""
+        kw = str(keyword or "").strip().lower()
+        row = max(1, int(expect_row))
+        col = max(0, int(expect_col))
+        max_row = int(self.txt.index("end-1c").split(".")[0])
+        row = min(row, max_row)
+        line_text = self.txt.get(f"{row}.0", f"{row}.end")
+        if kw and kw in line_text.lower():
+            found_col = line_text.lower().find(kw)
+            if found_col >= 0:
+                return row, found_col
+            return row, col
+
+        if not kw:
+            return row, col
+
+        candidate_rows = []
+        for r in range(1, max_row + 1):
+            t = self.txt.get(f"{r}.0", f"{r}.end")
+            if kw in t.lower():
+                candidate_rows.append(r)
+        if not candidate_rows:
+            return row, col
+        best_row = min(candidate_rows, key=lambda r: abs(r - row))
+        t = self.txt.get(f"{best_row}.0", f"{best_row}.end").lower()
+        best_col = t.find(kw)
+        if best_col < 0:
+            best_col = 0
+        return best_row, best_col
+
+    def _apply_jump_to_editor(self, row, col, keyword):
+        row, col = self._resolve_jump_target(row, col, keyword)
+        target_pos = f"{row}.{max(0, col)}"
+        self.txt.tag_remove("jump_hl", "1.0", tk.END)
+        self.txt.tag_remove("hl", "1.0", tk.END)
+        self.txt.tag_add("jump_hl", f"{row}.0", f"{row}.end")
+        if col >= 0:
+            end_col = col + max(1, len(str(keyword or "").strip()))
+            self.txt.tag_add("hl", f"{row}.{col}", f"{row}.{end_col}")
+        self.txt.mark_set(tk.INSERT, target_pos)
+        self.txt.see(target_pos)
+        self.txt.focus_set()
 
     def _insert_markdown_inline(self, text):
         i = 0
@@ -1889,6 +1945,7 @@ class FileViewerApp(tkdnd.Tk):
     def setup_pdf_lazy(self, source, display_name):
         self.pdf_lazy_source = source
         self.pdf_lazy_name = display_name
+        self.set_current_file_label(display_name)
         self.pdf_page_cache.clear()
         self.pdf_page_count = get_pdf_page_count(
             file_path=source.get("path"),
@@ -2075,6 +2132,8 @@ class FileViewerApp(tkdnd.Tk):
         self.file_search_hits.clear()
         self.content_search_hits.clear()
         self.current_search_type = ""
+        self._pending_multi_jump = None
+        self.set_current_file_label("")
 
     # ==============================
     # 文件/文件夹加载函数
@@ -2131,6 +2190,7 @@ class FileViewerApp(tkdnd.Tk):
         self._traverse_folder(folder_path, root_node, 1)
 
         self.title(f"文件查看器 - {root_name}")
+        self.set_current_file_label(root_name)
         self.txt.insert("1.0", f"✅ 已加载文件夹：{folder_path}\n排序规则：文件夹优先 + 字母序（不区分大小写）")
         self.refresh_line_numbers()
 
@@ -2248,6 +2308,7 @@ class FileViewerApp(tkdnd.Tk):
                             self.display_image_in_editor(img, title=f"=== 图片文件：{os.path.basename(file_path)} ===")
                     else:
                         self.display_text_in_editor("(未安装Pillow，无法显示图片。请安装：pip install pillow)")
+                    self.set_current_file_label(os.path.basename(file_path))
                     self.title(f"文件查看器 - {os.path.basename(file_path)}")
                     return
 
@@ -2300,6 +2361,7 @@ class FileViewerApp(tkdnd.Tk):
                 file_node_id = f"file_{uuid.uuid4()}"
                 self._add_node("", os.path.basename(file_path), file_node_id, "file", content, file_path)
                 self.display_text_in_editor(content, file_ext=file_ext)
+                self.set_current_file_label(os.path.basename(file_path))
 
             except Exception as e:
                 messagebox.showerror("错误", f"加载文件失败：{str(e)}")
@@ -2462,13 +2524,14 @@ class FileViewerApp(tkdnd.Tk):
                                 content = []
                                 content.append(f"=== Excel文件：{file_name} ===")
                                 for sheet_name in excel_data.sheet_names:
-                                    df = pd.read_excel(excel_buf, sheet_name=sheet_name, nrows=TABULAR_PREVIEW_ROWS)
+                                    excel_buf.seek(0)
+                                    df = pd.read_excel(excel_buf, sheet_name=sheet_name)
                                     content.append(f"\n--- Sheet: {sheet_name} ---")
                                     content.append(df.to_string(index=False))
                                 file_content = "\n".join(content)
                             elif file_ext == '.csv':
                                 csv_buf = io.StringIO(decode_bytes_auto(effective_data))
-                                df = pd.read_csv(csv_buf, nrows=TABULAR_PREVIEW_ROWS)
+                                df = pd.read_csv(csv_buf)
                                 file_content = df.to_string(index=False)
                         elif file_ext == '.json':
                             # JSON格式化
@@ -2534,6 +2597,8 @@ class FileViewerApp(tkdnd.Tk):
         if not selection:
             return
         node_id = selection[0]
+        node_text = self.tree.item(node_id, "text")
+        self.set_current_file_label(node_text)
         node_type = self.node_type.get(node_id)
         content = ""
 
@@ -2621,8 +2686,7 @@ class FileViewerApp(tkdnd.Tk):
                                 df = pd.read_csv(file_path, nrows=TABULAR_PREVIEW_ROWS)
                                 content = df.to_string(index=False)
                         elif file_ext == '.json':
-                            with open(file_path, 'r', encoding='utf-8', errors='replace') as f:
-                                json_content = f.read()
+                            json_content = read_text_file_auto(file_path)
                             try:
                                 json_data = json.loads(json_content)
                                 content = json.dumps(json_data, indent=4, ensure_ascii=False)
@@ -2631,8 +2695,7 @@ class FileViewerApp(tkdnd.Tk):
                         elif file_ext in ['.doc', '.docx']:
                             content = extract_doc_text(file_path)
                         else:
-                            with open(file_path, 'r', encoding='utf-8', errors='replace') as f:
-                                content = f.read()
+                            content = read_text_file_auto(file_path)
 
                     self.current_text_content = content
                 except Exception as e:
@@ -2653,6 +2716,13 @@ class FileViewerApp(tkdnd.Tk):
         node_path = self.node_full_path.get(node_id, "")
         ext = os.path.splitext(str(node_path))[1].lower()
         self.display_text_in_editor(content, file_ext=ext)
+        pending = self._pending_multi_jump
+        if pending and pending.get("node_id") == node_id:
+            self._pending_multi_jump = None
+            row = pending.get("row", 1)
+            col = pending.get("col", 0)
+            keyword = pending.get("keyword", "")
+            self.after_idle(lambda r=row, c=col, kw=keyword: self._apply_jump_to_editor(r, c, kw))
 
     def on_drop(self, event):
         """拖拽文件/文件夹"""
@@ -2963,31 +3033,18 @@ class FileViewerApp(tkdnd.Tk):
                 self.tree.focus_set()
             elif jump_type == "content":
                 row, col = entry[1], entry[2]
-                target_pos = f"{row}.{col}"
-                self.txt.tag_remove("jump_hl", "1.0", tk.END)
-                self.txt.tag_remove("hl", "1.0", tk.END)
-                self.txt.tag_add("jump_hl", f"{row}.0", f"{row}.end")
-                if col >= 0:
-                    end_col = col + max(1, len(self.search_entry.get().strip()))
-                    self.txt.tag_add("hl", f"{row}.{col}", f"{row}.{end_col}")
-                self.txt.mark_set(tk.INSERT, target_pos)
-                self.txt.see(target_pos)
-                self.txt.focus_set()
+                self._apply_jump_to_editor(row, col, self.search_entry.get().strip())
             elif jump_type == "content_multi":
                 node_id, row, col = entry[1], entry[2], entry[3]
-                self.tree.selection_set(node_id)
-                self.tree.see(node_id)
-                self.on_tree_select(None)
-                target_pos = f"{row}.{max(0, col)}"
-                self.txt.tag_remove("jump_hl", "1.0", tk.END)
-                self.txt.tag_remove("hl", "1.0", tk.END)
-                self.txt.tag_add("jump_hl", f"{row}.0", f"{row}.end")
-                if col >= 0:
-                    end_col = col + max(1, len(self.search_entry.get().strip()))
-                    self.txt.tag_add("hl", f"{row}.{col}", f"{row}.{end_col}")
-                self.txt.mark_set(tk.INSERT, target_pos)
-                self.txt.see(target_pos)
-                self.txt.focus_set()
+                kw = self.search_entry.get().strip()
+                current_selection = self.tree.selection()
+                if current_selection and current_selection[0] == node_id:
+                    self._apply_jump_to_editor(row, col, kw)
+                else:
+                    self._pending_multi_jump = {"node_id": node_id, "row": int(row), "col": int(col), "keyword": kw}
+                    self.tree.selection_set(node_id)
+                    self.tree.see(node_id)
+                    self.tree.focus_set()
         except Exception as e:
             messagebox.showinfo("提示", f"跳转失败：{str(e)}\n请选择有效的搜索结果行")
 
