@@ -1,5 +1,5 @@
 import tkinter as tk
-from tkinter import filedialog, scrolledtext, messagebox, ttk, colorchooser
+from tkinter import filedialog, messagebox, ttk, colorchooser
 import tkinter.font as tkfont
 import tkinterdnd2 as tkdnd
 import zipfile
@@ -502,8 +502,20 @@ class TextCompareWindow(tk.Toplevel):
         # 文本框1
         self.frame_text1 = tk.Frame(self.paned_main, bg="#f8f8f8")
         tk.Label(self.frame_text1, text="文件1内容", bg="#f8f8f8", font=("微软雅黑", 10, "bold")).pack(fill="x")
-        self.text1 = scrolledtext.ScrolledText(self.frame_text1, font=self.compare_font, wrap="word", bg="white")
-        self.text1.pack(fill="both", expand=True, padx=2, pady=2)
+        self.text1_container = tk.Frame(self.frame_text1, bg="#f8f8f8")
+        self.text1_container.pack(fill="both", expand=True, padx=2, pady=(2, 0))
+        self.text1_ybar = tk.Scrollbar(self.text1_container, orient="vertical")
+        self.text1_ybar.pack(side="right", fill="y")
+        self.text1 = tk.Text(self.text1_container, font=self.compare_font, wrap=tk.NONE, bg="white", undo=True)
+        self.text1.pack(side="left", fill="both", expand=True)
+        self.text1.configure(yscrollcommand=self.text1_ybar.set)
+        self.text1_ybar.config(command=self.text1.yview)
+        self.text1_xbar_bar = tk.Frame(self.frame_text1, bg="#f8f8f8", height=16)
+        self.text1_xbar_bar.pack(fill="x", padx=2, pady=(0, 2))
+        self.text1_xbar_bar.pack_propagate(False)
+        self.text1_xbar = tk.Scrollbar(self.text1_xbar_bar, orient="horizontal", command=self.text1.xview)
+        self.text1_xbar.pack(fill="both", expand=True)
+        self.text1.configure(xscrollcommand=self.text1_xbar.set)
         self.text1.drop_target_register(tkdnd.DND_FILES)
         self.text1.dnd_bind('<<Drop>>', lambda e: self.on_drop(e, 1))
         self.text1.bind("<FocusIn>", lambda e: self.set_active_compare_text(self.text1))
@@ -516,8 +528,20 @@ class TextCompareWindow(tk.Toplevel):
         # 文本框2
         self.frame_text2 = tk.Frame(self.paned_main, bg="#f8f8f8")
         tk.Label(self.frame_text2, text="文件2内容", bg="#f8f8f8", font=("微软雅黑", 10, "bold")).pack(fill="x")
-        self.text2 = scrolledtext.ScrolledText(self.frame_text2, font=self.compare_font, wrap="word", bg="white")
-        self.text2.pack(fill="both", expand=True, padx=2, pady=2)
+        self.text2_container = tk.Frame(self.frame_text2, bg="#f8f8f8")
+        self.text2_container.pack(fill="both", expand=True, padx=2, pady=(2, 0))
+        self.text2_ybar = tk.Scrollbar(self.text2_container, orient="vertical")
+        self.text2_ybar.pack(side="right", fill="y")
+        self.text2 = tk.Text(self.text2_container, font=self.compare_font, wrap=tk.NONE, bg="white", undo=True)
+        self.text2.pack(side="left", fill="both", expand=True)
+        self.text2.configure(yscrollcommand=self.text2_ybar.set)
+        self.text2_ybar.config(command=self.text2.yview)
+        self.text2_xbar_bar = tk.Frame(self.frame_text2, bg="#f8f8f8", height=16)
+        self.text2_xbar_bar.pack(fill="x", padx=2, pady=(0, 2))
+        self.text2_xbar_bar.pack_propagate(False)
+        self.text2_xbar = tk.Scrollbar(self.text2_xbar_bar, orient="horizontal", command=self.text2.xview)
+        self.text2_xbar.pack(fill="both", expand=True)
+        self.text2.configure(xscrollcommand=self.text2_xbar.set)
         self.text2.drop_target_register(tkdnd.DND_FILES)
         self.text2.dnd_bind('<<Drop>>', lambda e: self.on_drop(e, 2))
         self.text2.bind("<FocusIn>", lambda e: self.set_active_compare_text(self.text2))
@@ -1593,10 +1617,17 @@ class FileViewerApp(tkdnd.Tk):
         self.pdf_nav_frame.place_forget()
         self.line_num = tk.Text(self.txt_container, width=5, state="disabled", bg="#f0f0f0", font=self.line_num_font)
         self.line_num.pack(side="left", fill="y")
-        self.txt = scrolledtext.ScrolledText(self.txt_container, font=self.editor_font, wrap=tk.NONE, bg="white")
+        self.txt_ybar = tk.Scrollbar(self.txt_container, orient="vertical")
+        self.txt_ybar.pack(side="right", fill="y")
+        self.txt = tk.Text(self.txt_container, font=self.editor_font, wrap=tk.NONE, bg="white", undo=True)
         self.txt.pack(side="right", fill="both", expand=True)
-        self.txt_xbar = ttk.Scrollbar(self.text_panel, orient="horizontal", command=self.txt.xview)
-        self.txt_xbar.pack(fill="x", padx=2, pady=(0, 2))
+        self.txt.configure(yscrollcommand=self.txt_ybar.set)
+        self.txt_ybar.config(command=self.txt.yview)
+        self.txt_xbar_bar = tk.Frame(self.text_panel, bg="#f4f4f4", height=16)
+        self.txt_xbar_bar.pack(fill="x", padx=2, pady=(0, 2))
+        self.txt_xbar_bar.pack_propagate(False)
+        self.txt_xbar = tk.Scrollbar(self.txt_xbar_bar, orient="horizontal", command=self.txt.xview)
+        self.txt_xbar.pack(fill="both", expand=True)
         self.txt.configure(xscrollcommand=self.txt_xbar.set)
         self.pdf_corner_label = tk.Label(
             self.txt_container, text="", bg="#eef3ff", fg="#1f3a93", font=("微软雅黑", 9, "bold"),
@@ -1609,6 +1640,9 @@ class FileViewerApp(tkdnd.Tk):
         self.txt.bind("<MouseWheel>", self.on_pdf_mousewheel)
         self.txt.bind("<Button-4>", self.on_pdf_mousewheel)
         self.txt.bind("<Button-5>", self.on_pdf_mousewheel)
+        self.txt.bind("<Shift-MouseWheel>", self.on_text_horizontal_scroll)
+        self.txt.bind("<Shift-Button-4>", self.on_text_horizontal_scroll)
+        self.txt.bind("<Shift-Button-5>", self.on_text_horizontal_scroll)
         self.txt.bind("<Control-MouseWheel>", self.on_editor_zoom)
         self.txt.bind("<Control-Button-4>", self.on_editor_zoom)
         self.txt.bind("<Control-Button-5>", self.on_editor_zoom)
@@ -1635,14 +1669,26 @@ class FileViewerApp(tkdnd.Tk):
         self.result_title = tk.Label(self.result_frame, text="🔍 搜索结果预览 | 匹配数：0", bg="#f0f8f8",
                                      font=("微软雅黑", 9, "bold"), fg="#2196F3")
         self.result_title.pack(anchor="w", padx=5, pady=2)
-        self.result_txt = scrolledtext.ScrolledText(
-            self.result_frame, font=("Consolas", 10), bg="#fffff8", height=1, wrap=tk.NONE
-        )
-        self.result_txt.pack(fill="both", expand=True, padx=5, pady=2)
+        self.result_txt_container = tk.Frame(self.result_frame, bg="#f0f8f8")
+        self.result_txt_container.pack(fill="both", expand=True, padx=5, pady=(2, 0))
+        self.result_txt_ybar = tk.Scrollbar(self.result_txt_container, orient="vertical")
+        self.result_txt_ybar.pack(side="right", fill="y")
+        self.result_txt = tk.Text(self.result_txt_container, font=("Consolas", 10), bg="#fffff8", height=1,
+                                  wrap=tk.NONE)
+        self.result_txt.pack(side="left", fill="both", expand=True)
+        self.result_txt.configure(yscrollcommand=self.result_txt_ybar.set)
+        self.result_txt_ybar.config(command=self.result_txt.yview)
+        self.result_txt_xbar_bar = tk.Frame(self.result_frame, bg="#f0f8f8", height=16)
+        self.result_txt_xbar_bar.pack(fill="x", padx=5, pady=(0, 2))
+        self.result_txt_xbar_bar.pack_propagate(False)
+        self.result_txt_xbar = tk.Scrollbar(self.result_txt_xbar_bar, orient="horizontal",
+                                            command=self.result_txt.xview)
+        self.result_txt_xbar.pack(fill="both", expand=True)
+        self.result_txt.configure(xscrollcommand=self.result_txt_xbar.set)
         self.result_txt.config(state=tk.DISABLED)
         # 双击跳转绑定
         self.result_txt.bind("<Double-1>", self.on_double_click_jump)
-        self.right_paned.add(self.result_frame, height=38, minsize=28)
+        self.right_paned.add(self.result_frame, height=90, minsize=70)
 
         # 事件绑定
         self.txt.bind("<FocusIn>", lambda e: self.set_search_mode("content"))
@@ -2049,6 +2095,14 @@ class FileViewerApp(tkdnd.Tk):
             self.pdf_page_slider.set(target)
             self.render_pdf_page(target)
             return "break"
+
+    def on_text_horizontal_scroll(self, event):
+        if hasattr(event, "num") and event.num in (4, 5):
+            step = -4 if event.num == 4 else 4
+        else:
+            step = -4 if event.delta > 0 else 4
+        self.txt.xview_scroll(step, "units")
+        return "break"
 
     def on_text_panel_resize(self):
         if self.pdf_lazy_source:
@@ -2646,6 +2700,8 @@ class FileViewerApp(tkdnd.Tk):
             file_path = normalize_input_path(self.node_data.get(node_id))
             if file_path and os.path.exists(file_path):
                 try:
+                    pending = self._pending_multi_jump
+                    force_full_parse = bool(pending and pending.get("node_id") == node_id)
                     # 检查文件大小
                     file_size = os.path.getsize(file_path)
                     if file_size > self.max_file_size:
@@ -2668,7 +2724,7 @@ class FileViewerApp(tkdnd.Tk):
                             self.display_text_in_editor("(未安装Pillow，无法显示图片。请安装：pip install pillow)")
                         return
                     self.clear_pdf_lazy_state()
-                    if file_size > LARGE_FILE_THRESHOLD:
+                    if file_size > LARGE_FILE_THRESHOLD and not force_full_parse:
                         preview = read_text_preview_from_path(file_path)
                         content = f"=== 大文件预览：{os.path.basename(file_path)} ({file_size / 1024 / 1024:.2f}MB) ===\n\n{preview}"
                     else:
@@ -2678,12 +2734,18 @@ class FileViewerApp(tkdnd.Tk):
                                 content = []
                                 content.append(f"=== Excel文件：{os.path.basename(file_path)} ===")
                                 for sheet_name in excel_data.sheet_names:
-                                    df = pd.read_excel(file_path, sheet_name=sheet_name, nrows=TABULAR_PREVIEW_ROWS)
+                                    if force_full_parse:
+                                        df = pd.read_excel(file_path, sheet_name=sheet_name)
+                                    else:
+                                        df = pd.read_excel(file_path, sheet_name=sheet_name, nrows=TABULAR_PREVIEW_ROWS)
                                     content.append(f"\n--- Sheet: {sheet_name} ---")
                                     content.append(df.to_string(index=False))
                                 content = "\n".join(content)
                             elif file_ext == '.csv':
-                                df = pd.read_csv(file_path, nrows=TABULAR_PREVIEW_ROWS)
+                                if force_full_parse:
+                                    df = pd.read_csv(file_path)
+                                else:
+                                    df = pd.read_csv(file_path, nrows=TABULAR_PREVIEW_ROWS)
                                 content = df.to_string(index=False)
                         elif file_ext == '.json':
                             json_content = read_text_file_auto(file_path)
