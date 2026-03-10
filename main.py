@@ -1000,6 +1000,8 @@ class AlarmMonitorWindow(tk.Toplevel):
         self.file_label = tk.Label(top, text="未加载Excel（支持拖拽 .xlsx/.xls/.csv）", bg="#e8eef8", fg="#37474f",
                                    font=("微软雅黑", 9))
         self.file_label.pack(anchor="w", padx=8, pady=(2, 4))
+        self.result_count_label = tk.Label(top, text="当前告警数：0", bg="#e8eef8", fg="#37474f", font=("微软雅黑", 9))
+        self.result_count_label.pack(anchor="w", padx=8, pady=(0, 4))
 
         filters = tk.Frame(self, bg="#f4f4f4")
         filters.pack(fill="x", padx=8, pady=2)
@@ -1124,9 +1126,45 @@ class AlarmMonitorWindow(tk.Toplevel):
         # 无分隔符时保留“单机型字段可包含附加说明”的兼容行为
         return target_norm in text
 
+    def _extract_model_text_for_filter(self, row, model_col=None):
+        target_fields = {"支持产品列表", "芯片规划部署形态"}
+
+        # 1) 明确的列头优先（若列名符合目标字段）
+        if model_col and str(model_col).strip().replace(" ", "") in target_fields:
+            return str(row.get(model_col, "")).strip()
+
+        # 2) 从单元格首行解析“字段: 值”或“字段：值”
+        values = [str(v).strip() for v in row.values]
+        for i, cell in enumerate(values):
+            if not cell:
+                continue
+            lines = [ln.strip() for ln in cell.splitlines() if ln.strip()]
+            if not lines:
+                continue
+            first_line = lines[0]
+            key = first_line
+            val = ""
+            if "：" in first_line:
+                key, val = first_line.split("：", 1)
+            elif ":" in first_line:
+                key, val = first_line.split(":", 1)
+            key = str(key).strip().replace(" ", "")
+            val = str(val).strip()
+            if key not in target_fields:
+                continue
+            if val:
+                return val
+            if i + 1 < len(values) and values[i + 1]:
+                return values[i + 1]
+            if len(lines) > 1:
+                return "\n".join(lines[1:]).strip()
+            return ""
+
+        return ""
+
     def _collect_alarm_df(self, df, fru_kw="", model_kw="", model_only_kw=""):
         fru_col = self._pick_col(df, ["FRU对象", "FRU"])
-        model_col = self._pick_col(df, ["支持产品列表", "支持产品", "产品列表"])
+        model_col = self._pick_col(df, ["支持产品列表", "芯片规划部署形态", "支持产品", "产品列表"])
 
         if df is None or len(df) == 0:
             return df.iloc[0:0].copy()
@@ -1134,7 +1172,7 @@ class AlarmMonitorWindow(tk.Toplevel):
         out_rows = []
         for _, row in df.iterrows():
             fru_val = str(row.get(fru_col, "")).strip() if fru_col else ""
-            model_val = str(row.get(model_col, "")).strip() if model_col else ""
+            model_val = self._extract_model_text_for_filter(row, model_col=model_col)
 
             if fru_kw:
                 if not fru_col:
@@ -1143,13 +1181,13 @@ class AlarmMonitorWindow(tk.Toplevel):
                     continue
 
             if model_kw:
-                if not model_col:
+                if not model_val:
                     continue
                 if model_kw.lower() not in model_val.lower():
                     continue
 
             if model_only_kw:
-                if not model_col:
+                if not model_val:
                     continue
                 if not self._is_only_model(model_val, model_only_kw):
                     continue
@@ -1273,6 +1311,8 @@ class AlarmMonitorWindow(tk.Toplevel):
             self.result_tree.delete(item)
         cols = list(df.columns) if df is not None else []
         self.result_tree["columns"] = cols
+        count = len(df) if df is not None else 0
+        self.result_count_label.config(text=f"当前告警数：{count}")
         if not cols:
             self.result_tree["displaycolumns"] = ()
             return
