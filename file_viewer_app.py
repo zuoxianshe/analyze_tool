@@ -2,6 +2,7 @@
 from app_common import *
 from text_compare_window import TextCompareWindow
 from alarm_monitor_window import AlarmMonitorWindow
+from tkinter import simpledialog
 
 class FileViewerApp(tkdnd.Tk):
     def __init__(self):
@@ -28,7 +29,8 @@ class FileViewerApp(tkdnd.Tk):
         self.editor_font_size = 10
         self.editor_font = tkfont.Font(family="Consolas", size=self.editor_font_size)
         self.editor_bold_font = tkfont.Font(family="Consolas", size=self.editor_font_size, weight="bold")
-        self.line_num_font = tkfont.Font(family="Consolas", size=max(8, self.editor_font_size - 1))
+        # 行号字号与正文一致，避免滚动后行号与正文错位
+        self.line_num_font = tkfont.Font(family="Consolas", size=self.editor_font_size)
         
         # 搜索相关变量（分开存储避免冲突）
         self.file_search_hits = []   # 文件名搜索结果 [(节点ID, 显示名称)]
@@ -40,6 +42,12 @@ class FileViewerApp(tkdnd.Tk):
         self.search_text_cache = {}    # 多文件搜索文本缓存：node_id -> {"key": ..., "lines": [...]}
         self._pending_multi_jump = None
         self.search_history = []       # 搜索历史（最近20次）
+        self.content_search_result_history = []      # 内容搜索结果历史（最近10次）
+        self.multi_content_result_history = []       # 多文件搜索结果历史（最近10次）
+        self.virtual_text_boxes = []                 # 虚拟多文本框（页签）
+        self.active_text_box_id = None
+        self._text_box_seq = 1
+        self.node_text_box_map = {}                  # 文件节点 -> 文本框页签id
 
         # ========== 顶部综合工具区（文件操作 + 文字编辑） ==========
         self.frame_tools = tk.Frame(self, bg="#e8eef8", bd=2, relief=tk.RIDGE)
@@ -131,6 +139,8 @@ class FileViewerApp(tkdnd.Tk):
 
         # 右上：文本编辑区
         self.text_panel = tk.Frame(self.right_paned, bg="#f4f4f4")
+        self.text_box_selector = tk.Frame(self.text_panel, bg="#eef2f8")
+        self.text_box_selector.pack(fill="x", padx=4, pady=(2, 0))
         self.current_file_label = tk.Label(
             self.text_panel, text="当前文件：-", bg="#f4f4f4", fg="#37474f", anchor="w", font=("微软雅黑", 9, "bold")
         )
@@ -151,13 +161,15 @@ class FileViewerApp(tkdnd.Tk):
         self.pdf_page_slider.pack(side="left", padx=4, fill="x", expand=True)
         self.pdf_page_slider.config(state=tk.DISABLED)
         self.pdf_nav_frame.place_forget()
-        self.line_num = tk.Text(self.txt_container, width=5, state="disabled", bg="#f0f0f0", font=self.line_num_font)
+        self.line_num = tk.Text(self.txt_container, width=6, state="disabled", bg="#f0f0f0", font=self.line_num_font, wrap=tk.NONE)
         self.line_num.pack(side="left", fill="y")
+        self.line_num.configure(cursor="arrow")
+        self.line_num.tag_config("ln", justify="right")
         self.txt_ybar = tk.Scrollbar(self.txt_container, orient="vertical")
         self.txt_ybar.pack(side="right", fill="y")
         self.txt = tk.Text(self.txt_container, font=self.editor_font, wrap=tk.NONE, bg="white", undo=True)
         self.txt.pack(side="right", fill="both", expand=True)
-        self.txt.configure(yscrollcommand=self.txt_ybar.set)
+        self.txt.configure(yscrollcommand=self.on_text_vertical_scroll)
         self.txt_ybar.config(command=self.txt.yview)
         self.txt_xbar_bar = tk.Frame(self.text_panel, bg="#f4f4f4", height=16)
         self.txt_xbar_bar.pack(fill="x", padx=2, pady=(0, 2))
@@ -182,6 +194,9 @@ class FileViewerApp(tkdnd.Tk):
         self.txt.bind("<Control-MouseWheel>", self.on_editor_zoom)
         self.txt.bind("<Control-Button-4>", self.on_editor_zoom)
         self.txt.bind("<Control-Button-5>", self.on_editor_zoom)
+        self.line_num.bind("<MouseWheel>", self.on_line_num_mousewheel)
+        self.line_num.bind("<Button-4>", self.on_line_num_mousewheel)
+        self.line_num.bind("<Button-5>", self.on_line_num_mousewheel)
         self.text_panel.bind("<Configure>", lambda e: self.on_text_panel_resize())
         # 文本标签配置
         self.txt.tag_config("hl", background="yellow")
@@ -206,15 +221,15 @@ class FileViewerApp(tkdnd.Tk):
                                     font=("微软雅黑",9,"bold"), fg="#2196F3")
         self.result_title.pack(anchor="w", padx=5, pady=2)
         self.result_txt_container = tk.Frame(self.result_frame, bg="#f0f8f8")
-        self.result_txt_container.pack(fill="both", expand=True, padx=5, pady=(2, 0))
+        self.result_txt_container.pack(fill="both", expand=True, padx=5, pady=(0, 0))
         self.result_txt_ybar = tk.Scrollbar(self.result_txt_container, orient="vertical")
         self.result_txt_ybar.pack(side="right", fill="y")
         self.result_txt = tk.Text(self.result_txt_container, font=("Consolas",10), bg="#fffff8", height=1, wrap=tk.NONE)
         self.result_txt.pack(side="left", fill="both", expand=True)
         self.result_txt.configure(yscrollcommand=self.result_txt_ybar.set)
         self.result_txt_ybar.config(command=self.result_txt.yview)
-        self.result_txt_xbar_bar = tk.Frame(self.result_frame, bg="#f0f8f8", height=16)
-        self.result_txt_xbar_bar.pack(fill="x", padx=5, pady=(0, 2))
+        self.result_txt_xbar_bar = tk.Frame(self.result_frame, bg="#f0f8f8", height=12)
+        self.result_txt_xbar_bar.pack(fill="x", padx=5, pady=(0, 0))
         self.result_txt_xbar_bar.pack_propagate(False)
         self.result_txt_xbar = tk.Scrollbar(self.result_txt_xbar_bar, orient="horizontal", command=self.result_txt.xview)
         self.result_txt_xbar.pack(fill="both", expand=True)
@@ -222,7 +237,9 @@ class FileViewerApp(tkdnd.Tk):
         self.result_txt.config(state=tk.DISABLED)
         # 双击跳转绑定
         self.result_txt.bind("<Double-1>", self.on_double_click_jump)
-        self.right_paned.add(self.result_frame, height=90, minsize=70)
+        self.right_paned.add(self.result_frame, height=58, minsize=24)
+        self.result_collapsed_height = 24
+        self.result_expanded_height = 120
 
         # 事件绑定
         self.txt.bind("<FocusIn>", lambda e: self.set_search_mode("content"))
@@ -236,6 +253,7 @@ class FileViewerApp(tkdnd.Tk):
         self.txt.dnd_bind('<<Drop>>', self.on_drop)
         self.bind_all("<Control-f>", self.focus_search_entry)
         self.bind_all("<Control-F>", self.focus_search_entry)
+        self._init_virtual_text_boxes()
 
     # ==============================
     # 基础工具函数
@@ -312,6 +330,168 @@ class FileViewerApp(tkdnd.Tk):
     def set_current_file_label(self, file_name):
         name = str(file_name).strip() if file_name else "-"
         self.current_file_label.config(text=f"当前文件：{name}")
+        if self.active_text_box_id:
+            box = self._get_active_text_box()
+            if box is not None and box.get("auto_title", True):
+                box["title"] = name
+                self._refresh_text_box_selector()
+
+    def _init_virtual_text_boxes(self):
+        self.virtual_text_boxes = [{"id": "tb_1", "title": "主文本框", "content": "", "auto_title": True}]
+        self.active_text_box_id = "tb_1"
+        self._text_box_seq = 2
+        self._refresh_text_box_selector()
+
+    def _create_text_box(self, title, content="", auto_title=True, switch_to=True):
+        new_id = f"tb_{self._text_box_seq}"
+        self._text_box_seq += 1
+        self.virtual_text_boxes.append({
+            "id": new_id,
+            "title": str(title or f"文本框{self._text_box_seq}"),
+            "content": str(content or ""),
+            "auto_title": bool(auto_title),
+        })
+        if switch_to:
+            self.switch_text_box(new_id)
+        else:
+            self._refresh_text_box_selector()
+        return new_id
+
+    def _ensure_text_box_for_node(self, node_id, node_title):
+        box_id = self.node_text_box_map.get(node_id)
+        if box_id:
+            exists = any(b.get("id") == box_id for b in self.virtual_text_boxes)
+            if exists:
+                self.switch_text_box(box_id)
+                return box_id
+        # 首次解析该文件节点：自动新建文本框页签
+        new_id = self._create_text_box(node_title, content="", auto_title=True, switch_to=True)
+        self.node_text_box_map[node_id] = new_id
+        return new_id
+
+    def _get_active_text_box(self):
+        for b in self.virtual_text_boxes:
+            if b.get("id") == self.active_text_box_id:
+                return b
+        return None
+
+    def _sync_active_text_box_content(self):
+        box = self._get_active_text_box()
+        if box is None:
+            return
+        box["content"] = self.txt.get("1.0", "end-1c")
+
+    def _refresh_text_box_selector(self):
+        for w in self.text_box_selector.winfo_children():
+            w.destroy()
+        for idx, b in enumerate(self.virtual_text_boxes, start=1):
+            bid = b.get("id")
+            title = b.get("title") or f"文本框{idx}"
+            label = f"{idx}:{title}"
+            is_active = bid == self.active_text_box_id
+            tab = tk.Frame(
+                self.text_box_selector,
+                bg="#dfe8f6" if is_active else "#f4f7fb",
+                bd=1,
+                relief=tk.SUNKEN if is_active else tk.RAISED
+            )
+            tab.pack(side="left", padx=2, pady=2)
+
+            title_btn = tk.Button(
+                tab,
+                text=label,
+                relief=tk.FLAT,
+                bd=0,
+                font=("微软雅黑", 8),
+                bg="#dfe8f6" if is_active else "#f4f7fb",
+                activebackground="#dfe8f6",
+                command=lambda x=bid: self.switch_text_box(x)
+            )
+            title_btn.pack(side="left", padx=(4, 1), pady=1)
+            title_btn.bind("<Double-1>", lambda e, x=bid: self.rename_text_box(x))
+            title_btn.bind("<Button-3>", lambda e, x=bid: self.rename_text_box(x))
+
+            close_btn = tk.Button(
+                tab,
+                text="x",
+                width=2,
+                relief=tk.FLAT,
+                bd=0,
+                font=("Consolas", 8, "bold"),
+                fg="#b71c1c",
+                bg="#dfe8f6" if is_active else "#f4f7fb",
+                activebackground="#ffcdd2",
+                command=lambda x=bid: self.close_text_box(x)
+            )
+            close_btn.pack(side="left", padx=(1, 3), pady=1)
+
+    def rename_text_box(self, box_id):
+        box = None
+        for b in self.virtual_text_boxes:
+            if b.get("id") == box_id:
+                box = b
+                break
+        if box is None:
+            return
+        current_title = box.get("title") or "文本框"
+        new_title = simpledialog.askstring("重命名页签", "请输入新页签名称：", initialvalue=current_title, parent=self)
+        if new_title is None:
+            return
+        new_title = str(new_title).strip()
+        if not new_title:
+            return
+        box["title"] = new_title
+        box["auto_title"] = False
+        if box_id == self.active_text_box_id:
+            self.current_file_label.config(text=f"当前文件：{new_title}")
+        self._refresh_text_box_selector()
+
+    def close_text_box(self, box_id):
+        if len(self.virtual_text_boxes) <= 1:
+            messagebox.showinfo("提示", "至少保留一个文本框页签")
+            return
+        self._sync_active_text_box_content()
+        idx = -1
+        for i, b in enumerate(self.virtual_text_boxes):
+            if b.get("id") == box_id:
+                idx = i
+                break
+        if idx < 0:
+            return
+        was_active = (box_id == self.active_text_box_id)
+        del self.virtual_text_boxes[idx]
+        self.node_text_box_map = {k: v for k, v in self.node_text_box_map.items() if v != box_id}
+        if was_active:
+            new_idx = max(0, idx - 1)
+            self.active_text_box_id = self.virtual_text_boxes[new_idx].get("id")
+            target = self.virtual_text_boxes[new_idx]
+            content = target.get("content", "")
+            self.txt.delete("1.0", tk.END)
+            self.txt.insert("1.0", content)
+            self.current_text_content = content
+            self.refresh_line_numbers()
+            self.current_file_label.config(text=f"当前文件：{target.get('title', '-')}")
+        self._refresh_text_box_selector()
+
+    def switch_text_box(self, box_id):
+        if box_id == self.active_text_box_id:
+            return
+        self._sync_active_text_box_content()
+        target = None
+        for b in self.virtual_text_boxes:
+            if b.get("id") == box_id:
+                target = b
+                break
+        if target is None:
+            return
+        self.active_text_box_id = box_id
+        content = target.get("content", "")
+        self.txt.delete("1.0", tk.END)
+        self.txt.insert("1.0", content)
+        self.current_text_content = content
+        self.refresh_line_numbers()
+        self.current_file_label.config(text=f"当前文件：{target.get('title', '-')}")
+        self._refresh_text_box_selector()
 
     def record_search_history(self, keyword):
         kw = str(keyword or "").strip()
@@ -329,16 +509,111 @@ class FileViewerApp(tkdnd.Tk):
         self.search_entry.insert(0, str(keyword))
         self.search_entry.focus_set()
 
+    def _upsert_result_history(self, mode, keyword, hits):
+        kw = str(keyword or "").strip()
+        if not kw:
+            return
+        history = self.content_search_result_history if mode == "content" else self.multi_content_result_history
+        history[:] = [h for h in history if h.get("keyword") != kw]
+        history.append({"keyword": kw, "hits": list(hits), "collapsed": False})
+        if len(history) > 10:
+            del history[:-10]
+
+    def _toggle_result_history(self, mode, keyword):
+        history = self.content_search_result_history if mode == "content" else self.multi_content_result_history
+        for item in history:
+            if item.get("keyword") == keyword:
+                item["collapsed"] = not item.get("collapsed", False)
+                break
+
+    def _render_result_history(self, mode):
+        history = self.content_search_result_history if mode == "content" else self.multi_content_result_history
+        self.preview_line_to_hit_index.clear()
+        self.preview_jump_entries.clear()
+        self.result_txt.config(state=tk.NORMAL)
+        self.result_txt.delete("1.0", tk.END)
+
+        if not history:
+            title = "内容搜索结果历史" if mode == "content" else "多文件搜索结果历史"
+            self.result_txt.insert("1.0", "暂无历史搜索结果")
+            self.result_title.config(text=f"🔍 {title} | 记录数：0")
+            self.result_txt.config(state=tk.DISABLED)
+            self.set_result_panel_collapsed(True)
+            return
+
+        lines = []
+        for record in reversed(history):
+            kw = record.get("keyword", "")
+            hits = record.get("hits", [])
+            collapsed = bool(record.get("collapsed", False))
+            marker = "▶" if collapsed else "▼"
+            header = f"{marker} 关键词：{kw} | 命中数：{len(hits)}"
+            lines.append(header)
+            self.preview_jump_entries.append(("history_toggle", mode, kw))
+            if collapsed:
+                continue
+
+            max_show = 500
+            show_hits = hits[:max_show]
+            if mode == "content":
+                for row, col, content in show_hits:
+                    lines.append(f"  第{row}行: {content}")
+                    self.preview_jump_entries.append(("content", int(row), int(col)))
+            else:
+                for nid, row, col, line in show_hits:
+                    name = self.tree.item(nid, "text")
+                    lines.append(f"  [{name}] 第{row}行: {line}")
+                    self.preview_jump_entries.append(("content_multi", nid, int(row), int(col)))
+            if len(hits) > max_show:
+                lines.append(f"  ... 共 {len(hits)} 条，仅显示前 {max_show} 条")
+                self.preview_jump_entries.append(None)
+
+        self.result_txt.insert("1.0", "\n".join(lines))
+        title = "内容搜索结果历史" if mode == "content" else "多文件搜索结果历史"
+        self.result_title.config(text=f"🔍 {title} | 记录数：{len(history)}（最近10次）")
+        self.result_txt.config(state=tk.DISABLED)
+        self.set_result_panel_collapsed(False)
+
+    def set_result_panel_collapsed(self, collapsed):
+        h = self.result_collapsed_height if collapsed else self.result_expanded_height
+        try:
+            self.right_paned.paneconfigure(self.result_frame, height=h)
+        except Exception:
+            pass
+
     def refresh_line_numbers(self):
         """刷新行号"""
         self.line_num.config(state=tk.NORMAL)
         self.line_num.delete("1.0", tk.END)
         try:
             line_count = int(self.txt.index("end-1c").split(".")[0])
-            self.line_num.insert("end", "\n".join(str(i) for i in range(1, line_count+1)))
+            self.line_num.insert("end", "\n".join(str(i) for i in range(1, line_count+1)), "ln")
         except:
             pass
         self.line_num.config(state=tk.DISABLED)
+        try:
+            first, _ = self.txt.yview()
+            self.line_num.yview_moveto(first)
+        except Exception:
+            pass
+
+    def on_text_vertical_scroll(self, first, last):
+        self.txt_ybar.set(first, last)
+        try:
+            self.line_num.yview_moveto(float(first))
+        except Exception:
+            pass
+
+    def on_line_num_mousewheel(self, event):
+        handled = self.on_pdf_mousewheel(event)
+        if handled == "break":
+            return "break"
+        if hasattr(event, "num") and event.num in (4, 5):
+            step = -3 if event.num == 4 else 3
+        else:
+            step = -3 if getattr(event, "delta", 0) > 0 else 3
+        self.txt.yview_scroll(step, "units")
+        return "break"
 
     def on_editor_zoom(self, event):
         if hasattr(event, "num") and event.num in (4, 5):
@@ -351,7 +626,7 @@ class FileViewerApp(tkdnd.Tk):
         self.editor_font_size = new_size
         self.editor_font.configure(size=new_size)
         self.editor_bold_font.configure(size=new_size)
-        self.line_num_font.configure(size=max(8, new_size - 1))
+        self.line_num_font.configure(size=new_size)
         self.txt.tag_config("md_bold", font=("Consolas", new_size, "bold"))
         self.txt.tag_config("md_italic", font=("Consolas", new_size, "italic"))
         self.refresh_line_numbers()
@@ -380,6 +655,7 @@ class FileViewerApp(tkdnd.Tk):
             self.txt.insert("1.0", content)
             self.set_markdown_render_button_state(False)
         self.current_text_content = self.txt.get("1.0", "end-1c")
+        self._sync_active_text_box_content()
         self.refresh_line_numbers()
 
     def _resolve_jump_target(self, expect_row, expect_col, keyword):
@@ -660,6 +936,7 @@ class FileViewerApp(tkdnd.Tk):
 
     def on_text_edited(self):
         self.current_text_content = self.txt.get("1.0", "end-1c")
+        self._sync_active_text_box_content()
         self.refresh_line_numbers()
 
     def save_current_text(self, event=None):
@@ -735,6 +1012,8 @@ class FileViewerApp(tkdnd.Tk):
         self.file_search_hits.clear()
         self.content_search_hits.clear()
         self.current_search_type = ""
+        self.node_text_box_map.clear()
+        self._init_virtual_text_boxes()
         self._pending_multi_jump = None
         self.set_current_file_label("")
 
@@ -1197,8 +1476,10 @@ class FileViewerApp(tkdnd.Tk):
             return
         node_id = selection[0]
         node_text = self.tree.item(node_id, "text")
-        self.set_current_file_label(node_text)
         node_type = self.node_type.get(node_id)
+        if node_type in ("file", "local_file"):
+            self._ensure_text_box_for_node(node_id, node_text)
+        self.set_current_file_label(node_text)
         content = ""
         
         if node_type == "file":
@@ -1357,6 +1638,21 @@ class FileViewerApp(tkdnd.Tk):
         """打开监控告警窗口"""
         AlarmMonitorWindow(self)
 
+    def open_stacked_text_box(self):
+        """在文本框上方新增可选择的文本框页签。"""
+        self._sync_active_text_box_content()
+        title = self.current_file_label.cget("text").replace("当前文件：", "").strip() or f"文本框{self._text_box_seq}"
+        new_id = f"tb_{self._text_box_seq}"
+        self._text_box_seq += 1
+        self.virtual_text_boxes.append({
+            "id": new_id,
+            "title": title,
+            "content": self.txt.get("1.0", "end-1c"),
+            "auto_title": True,
+        })
+        self.active_text_box_id = new_id
+        self._refresh_text_box_selector()
+
     # ==============================
     # 搜索功能
     # ==============================
@@ -1412,6 +1708,7 @@ class FileViewerApp(tkdnd.Tk):
                 self.preview_jump_entries.append(("file", nid))
             self.result_txt.insert("1.0", "\n".join(hit_texts))
             self.result_title.config(text=f"🔍 文件名搜索结果 | 匹配数：{len(self.file_search_hits)}")
+            self.set_result_panel_collapsed(False)
             # 定位到第一个结果
             first_node = self.file_search_hits[0][0]
             self.tree.selection_set(first_node)
@@ -1419,6 +1716,7 @@ class FileViewerApp(tkdnd.Tk):
         else:
             self.result_txt.insert("1.0", "未找到匹配的文件名")
             self.result_title.config(text="🔍 文件名搜索结果 | 匹配数：0")
+            self.set_result_panel_collapsed(True)
         
         self.result_txt.config(state=tk.DISABLED)
 
@@ -1467,24 +1765,8 @@ class FileViewerApp(tkdnd.Tk):
             start_pos = end_pos
             hit_count += 1
         
-        # 更新预览框
-        self.result_txt.config(state=tk.NORMAL)
-        self.result_txt.delete("1.0", tk.END)
-        
-        if self.content_search_hits:
-            # 显示命中结果
-            hit_texts = []
-            for idx, (row, col, content) in enumerate(self.content_search_hits):
-                hit_texts.append(f"第{row}行: {content}")
-                self.preview_line_to_hit_index.append(idx)
-                self.preview_jump_entries.append(("content", int(row), int(col)))
-            self.result_txt.insert("1.0", "\n".join(hit_texts))
-            self.result_title.config(text=f"🔍 内容搜索结果 | 匹配数：{hit_count}")
-        else:
-            self.result_txt.insert("1.0", "未找到匹配的内容")
-            self.result_title.config(text="🔍 内容搜索结果 | 匹配数：0")
-        
-        self.result_txt.config(state=tk.DISABLED)
+        self._upsert_result_history("content", keyword, self.content_search_hits)
+        self._render_result_history("content")
         self.refresh_line_numbers()
 
     def _extract_text_lines_for_search(self, node_id):
@@ -1594,26 +1876,8 @@ class FileViewerApp(tkdnd.Tk):
         finally:
             self.config(cursor="")
 
-        self.result_txt.config(state=tk.NORMAL)
-        self.result_txt.delete("1.0", tk.END)
-        if self.multi_content_search_hits:
-            max_show = 500
-            show_hits = self.multi_content_search_hits[:max_show]
-            texts = []
-            for idx, (nid, row, col, line) in enumerate(show_hits, start=1):
-                name = self.tree.item(nid, "text")
-                texts.append(f"{idx}. [{name}] 第{row}行: {line}")
-                self.preview_line_to_hit_index.append(idx - 1)
-                self.preview_jump_entries.append(("content_multi", nid, int(row), int(col)))
-            if len(self.multi_content_search_hits) > max_show:
-                texts.append(f"... 共 {len(self.multi_content_search_hits)} 条，仅显示前 {max_show} 条")
-                self.preview_jump_entries.append(None)
-            self.result_txt.insert("1.0", "\n".join(texts))
-            self.result_title.config(text=f"🔍 多文件内容搜索 | 匹配数：{len(self.multi_content_search_hits)}")
-        else:
-            self.result_txt.insert("1.0", "未找到匹配的内容")
-            self.result_title.config(text="🔍 多文件内容搜索 | 匹配数：0")
-        self.result_txt.config(state=tk.DISABLED)
+        self._upsert_result_history("content_multi", keyword, self.multi_content_search_hits)
+        self._render_result_history("content_multi")
 
     def on_double_click_jump(self, event):
         """双击搜索结果跳转"""
@@ -1631,6 +1895,11 @@ class FileViewerApp(tkdnd.Tk):
             if not entry:
                 return
             jump_type = entry[0]
+            if jump_type == "history_toggle":
+                mode, kw = entry[1], entry[2]
+                self._toggle_result_history(mode, kw)
+                self._render_result_history(mode)
+                return
 
             if jump_type == "file":
                 node_id = entry[1]
@@ -1674,6 +1943,7 @@ class FileViewerApp(tkdnd.Tk):
         
         # 重置标题
         self.result_title.config(text="🔍 搜索结果预览 | 匹配数：0")
+        self.set_result_panel_collapsed(True)
         
         # 清空搜索结果列表
         self.file_search_hits.clear()
